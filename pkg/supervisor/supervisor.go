@@ -22,7 +22,7 @@ import (
 
 // Config holds supervisor configuration
 type Config struct {
-	MountDir      string   // Host directory to mount (overlay base)
+	MountDir      string // Host directory to mount (workspace source)
 	Interactive   bool
 	DBPath        string
 	EnableTracer  bool     // Enable ptrace tracer
@@ -31,12 +31,15 @@ type Config struct {
 	Command       []string // Command to run (overrides shell)
 }
 
+// guestHomePath is the home directory path inside the sandbox
+const guestHomePath = "/home/agent"
+
 // Run starts the bubblewrap sandbox with the given configuration
 func Run(cfg Config) error {
 	var overlayMounter *artfs.OverlayMounter
 	var store *db.Store
 	var cleanupFuse func()
-	var workspacePath string
+	var fuseMountPoint string
 
 	// Resolve MountDir
 	absMountDir, err := filepath.Abs(cfg.MountDir)
@@ -44,9 +47,14 @@ func Run(cfg Config) error {
 		return fmt.Errorf("error resolving mount path: %w", err)
 	}
 
+	// Extract workspace name from mount directory
+	workspaceName := filepath.Base(absMountDir)
+	guestWorkspacePath := filepath.Join(guestHomePath, workspaceName)
+
 	// Setup FUSE filesystem if database path provided
 	if cfg.DBPath != "" {
-		// Overlay mode: read from host (MountDir), write to SQLite
+		// Overlay mode: FUSE backs /home/agent entirely
+		// Workspace files from host are accessible at /home/agent/<workspace>
 		var err error
 		store, err = db.Open(db.DefaultConfig(cfg.DBPath))
 		if err != nil {
@@ -54,26 +62,26 @@ func Run(cfg Config) error {
 		}
 		defer store.Close()
 
-		// Create HostFS from mount directory
+		// Create HostFS from mount directory, mapped to workspace subpath
 		hostfs, err := overlay.NewHostFS(absMountDir)
 		if err != nil {
 			return fmt.Errorf("failed to create host filesystem: %w", err)
 		}
 
-		// Create AgentFS for delta layer
+		// Create AgentFS for delta layer (entire /home/agent)
 		agentfs, err := overlay.NewAgentFS(store)
 		if err != nil {
 			return fmt.Errorf("failed to create agent filesystem: %w", err)
 		}
 
-		// Create OverlayFS
-		overlayfs, err := overlay.NewOverlayFS(hostfs, agentfs)
+		// Create OverlayFS with workspace name for host mapping
+		overlayfs, err := overlay.NewOverlayFS(hostfs, agentfs, overlay.WithWorkspaceName(workspaceName))
 		if err != nil {
 			return fmt.Errorf("failed to create overlay filesystem: %w", err)
 		}
 
 		// Create temporary mount point
-		mountPoint, err := os.MkdirTemp("", "art-overlay-*")
+		fuseMountPoint, err = os.MkdirTemp("", "art-overlay-*")
 		if err != nil {
 			return fmt.Errorf("failed to create temp mount point: %w", err)
 		}
@@ -82,56 +90,45 @@ func Run(cfg Config) error {
 			if overlayMounter != nil {
 				overlayMounter.Unmount()
 			}
-			os.RemoveAll(mountPoint)
+			os.RemoveAll(fuseMountPoint)
 		}
 		defer cleanupFuse()
 
 		// Mount overlay FUSE filesystem
-		overlayMounter, err = artfs.MountOverlay(mountPoint, overlayfs)
+		overlayMounter, err = artfs.MountOverlay(fuseMountPoint, overlayfs)
 		if err != nil {
-			os.RemoveAll(mountPoint)
+			os.RemoveAll(fuseMountPoint)
 			return fmt.Errorf("failed to mount overlay FUSE: %w", err)
 		}
 
-		// Use FUSE mount as workspace
-		workspacePath = mountPoint
-		fmt.Printf("Overlay FUSE mounted at: %s\n", mountPoint)
-		fmt.Printf("Base (read): %s\n", absMountDir)
+		fmt.Printf("Overlay FUSE mounted at: %s\n", fuseMountPoint)
+		fmt.Printf("Host workspace: %s -> %s\n", absMountDir, guestWorkspacePath)
 		fmt.Printf("Delta (write): %s\n", cfg.DBPath)
 
 	} else {
-		// Direct mount mode
-		workspacePath = absMountDir
-		fmt.Printf("Direct mount: %s\n", absMountDir)
+		// Direct mount mode - still use the new layout
+		fmt.Printf("Direct mount: %s -> %s\n", absMountDir, guestWorkspacePath)
 	}
 
 	fmt.Printf("--- Starting Sandbox ---\n")
-	fmt.Printf("Workspace: %s\n", workspacePath)
+	fmt.Printf("Guest home: %s\n", guestHomePath)
+	fmt.Printf("Guest workspace: %s\n", guestWorkspacePath)
 	fmt.Printf("Interactive: %v\n", cfg.Interactive)
 
-	// Define Bubblewrap Command
+	// Build Bubblewrap arguments
+	// Mount entire host filesystem read-only for access to packages, tools, etc.
 	bwrapArgs := []string{
-		// Read-only system paths
-		"--ro-bind", "/usr", "/usr",
-		"--ro-bind", "/bin", "/bin",
-		"--ro-bind", "/lib", "/lib",
-		"--ro-bind-try", "/lib64", "/lib64",
-
-		// Workspace mapping
-		"--bind", workspacePath, "/home/agent",
+		// Mount root filesystem read-only
+		"--ro-bind", "/", "/",
 
 		// Process information
 		"--proc", "/proc",
 
-		// Create directories
-		"--dir", "/home",
-		"--dir", "/home/agent",
-		"--dir", "/tmp",
+		// Writable /tmp
 		"--tmpfs", "/tmp",
-		"--dir", "/opt",
-		"--dir", "/opt/bin",
-		"--dir", "/opt/lib",
-		"--dir", "/opt/node",
+
+		// Writable /home (overlay on read-only root)
+		"--tmpfs", "/home",
 
 		// Devices
 		"--dev-bind", "/dev/null", "/dev/null",
@@ -140,16 +137,34 @@ func Run(cfg Config) error {
 		"--dev-bind", "/dev/urandom", "/dev/urandom",
 
 		// Isolation
-		"--unshare-net",
+		// "--unshare-net",
 		"--unshare-pid",
 		"--die-with-parent",
 		"--new-session",
-
-		// Environment
-		"--chdir", "/home/agent",
-		"--setenv", "HOME", "/home/agent",
-		"--setenv", "PATH", "/opt/node/bin:/opt/bin:/bin:/usr/bin",
 	}
+
+	// Mount home directory (FUSE or direct)
+	if cfg.DBPath != "" {
+		// FUSE overlay mode: bind FUSE mount as /home/agent
+		bwrapArgs = append(bwrapArgs,
+			"--dir", guestHomePath,
+			"--bind", fuseMountPoint, guestHomePath,
+		)
+	} else {
+		// Direct mode: bind workspace directly at /home/agent/<workspace>
+		bwrapArgs = append(bwrapArgs,
+			"--dir", guestHomePath,
+			"--dir", guestWorkspacePath,
+			"--bind", absMountDir, guestWorkspacePath,
+		)
+	}
+
+	// Environment
+	bwrapArgs = append(bwrapArgs,
+		"--chdir", guestWorkspacePath,
+		"--setenv", "HOME", guestHomePath,
+		"--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+	)
 
 	// Load user config from .art/config/binds.json
 	userCfgPath := filepath.Join(absMountDir, ".art", "config", "binds.json")
@@ -386,4 +401,3 @@ func loadUserConfig(path string) (*UserConfig, error) {
 	}
 	return &cfg, nil
 }
-

@@ -716,19 +716,27 @@ func (a *AgentFS) ReadFile(ctx context.Context, path string) ([]byte, error) {
 }
 
 // CopyFromBase copies a file from the base filesystem to AgentFS
+// Uses the same path for both source and destination.
 func (a *AgentFS) CopyFromBase(ctx context.Context, path string, base FileSystem) (uint64, error) {
+	return a.CopyFromBaseWithPath(ctx, path, path, base)
+}
+
+// CopyFromBaseWithPath copies a file from the base filesystem to AgentFS
+// deltaPath is where the file will be created in AgentFS
+// basePath is where the file is read from in the base filesystem
+func (a *AgentFS) CopyFromBaseWithPath(ctx context.Context, deltaPath, basePath string, base FileSystem) (uint64, error) {
 	// Get stats from base
-	stats, err := base.Lstat(ctx, path)
+	stats, err := base.Lstat(ctx, basePath)
 	if err != nil {
 		return 0, err
 	}
 
-	// Ensure parent directories exist
-	if err := a.EnsureParentDirs(ctx, path); err != nil {
+	// Ensure parent directories exist in delta
+	if err := a.EnsureParentDirs(ctx, deltaPath); err != nil {
 		return 0, err
 	}
 
-	parentIno, name, err := a.resolveParentAndName(ctx, path)
+	parentIno, name, err := a.resolveParentAndName(ctx, deltaPath)
 	if err != nil {
 		return 0, err
 	}
@@ -736,7 +744,7 @@ func (a *AgentFS) CopyFromBase(ctx context.Context, path string, base FileSystem
 	var ino uint64
 	if stats.IsRegular() {
 		// Read content from base
-		f, err := base.Open(ctx, path, O_RDONLY)
+		f, err := base.Open(ctx, basePath, O_RDONLY)
 		if err != nil {
 			return 0, err
 		}
@@ -766,7 +774,7 @@ func (a *AgentFS) CopyFromBase(ctx context.Context, path string, base FileSystem
 		})
 	} else if stats.IsSymlink() {
 		// Copy symlink
-		target, err := base.Readlink(ctx, path)
+		target, err := base.Readlink(ctx, basePath)
 		if err != nil {
 			return 0, err
 		}

@@ -14,7 +14,9 @@ import (
 var pullCmd = &cobra.Command{
 	Use:   "pull",
 	Short: "Pull files from SQLite database to workspace",
-	Long:  `Pulls all files from the SQLite database to the workspace directory.`,
+	Long: `Pulls files from the SQLite database to the workspace directory.
+Only exports the workspace subdirectory (/<workspace-name>/) contents to the host.
+The workspace name is derived from the mount directory basename.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if dbPath == "" {
 			fmt.Println("Error: --db flag is required")
@@ -32,6 +34,17 @@ func init() {
 }
 
 func runPull(dbPath, outputDir string) error {
+	// Resolve output directory
+	absOutputDir, err := filepath.Abs(outputDir)
+	if err != nil {
+		return fmt.Errorf("cannot resolve output directory: %w", err)
+	}
+
+	// Extract workspace name from output directory
+	workspaceName := filepath.Base(absOutputDir)
+	fmt.Printf("Workspace name: %s\n", workspaceName)
+	fmt.Printf("Exporting from: /%s/\n", workspaceName)
+
 	// Open database
 	store, err := db.Open(db.DefaultConfig(dbPath))
 	if err != nil {
@@ -40,14 +53,26 @@ func runPull(dbPath, outputDir string) error {
 	defer store.Close()
 
 	// Create output directory
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := os.MkdirAll(absOutputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
 	ctx := context.Background()
 
-	// Export starting from root (ino=1)
-	return pullDir(ctx, store, 1, outputDir)
+	// Find the workspace directory in the DB
+	workspaceIno, err := store.Lookup(ctx, 1, workspaceName)
+	if err != nil {
+		if err == db.ErrNotFound {
+			fmt.Printf("Workspace directory /%s/ not found in database\n", workspaceName)
+			return nil
+		}
+		return fmt.Errorf("failed to find workspace directory: %w", err)
+	}
+
+	fmt.Printf("Workspace directory inode: %d\n", workspaceIno)
+
+	// Export starting from workspace directory
+	return pullDir(ctx, store, workspaceIno, absOutputDir)
 }
 
 func pullDir(ctx context.Context, store *db.Store, ino uint64, path string) error {

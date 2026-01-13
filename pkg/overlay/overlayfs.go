@@ -2,6 +2,7 @@ package overlay
 
 import (
 	"context"
+	"strings"
 	"sync"
 )
 
@@ -9,18 +10,36 @@ import (
 // Reads come from the base layer (HostFS) and writes go to the delta layer (AgentFS).
 // Deleted files from the base are tracked as "whiteouts" in the delta.
 type OverlayFS struct {
-	base     FileSystem      // Read-only base layer (HostFS)
-	delta    *AgentFS        // Writable delta layer (SQLite)
-	whiteout *WhiteoutCache  // In-memory cache of deleted paths
-	mu       sync.RWMutex
+	base          FileSystem     // Read-only base layer (HostFS)
+	delta         *AgentFS       // Writable delta layer (SQLite)
+	whiteout      *WhiteoutCache // In-memory cache of deleted paths
+	workspaceName string         // Subdirectory name where base is mounted (empty = root)
+	mu            sync.RWMutex
+}
+
+// OverlayOption configures OverlayFS behavior
+type OverlayOption func(*OverlayFS)
+
+// WithWorkspaceName sets the subdirectory where the base filesystem is mounted.
+// For example, if workspace name is "myproject", the base filesystem contents
+// appear at "/myproject/..." in the overlay.
+func WithWorkspaceName(name string) OverlayOption {
+	return func(o *OverlayFS) {
+		o.workspaceName = name
+	}
 }
 
 // NewOverlayFS creates a new overlay filesystem
-func NewOverlayFS(base FileSystem, delta *AgentFS) (*OverlayFS, error) {
+func NewOverlayFS(base FileSystem, delta *AgentFS, opts ...OverlayOption) (*OverlayFS, error) {
 	o := &OverlayFS{
 		base:     base,
 		delta:    delta,
 		whiteout: NewWhiteoutCache(),
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		opt(o)
 	}
 
 	// Load existing whiteouts from database
@@ -32,6 +51,37 @@ func NewOverlayFS(base FileSystem, delta *AgentFS) (*OverlayFS, error) {
 	o.whiteout.LoadFromPaths(paths)
 
 	return o, nil
+}
+
+// WorkspaceName returns the workspace subdirectory name
+func (o *OverlayFS) WorkspaceName() string {
+	return o.workspaceName
+}
+
+// toBasePath converts an overlay path to a base path.
+// Returns empty string if the path is not under the workspace.
+func (o *OverlayFS) toBasePath(overlayPath string) string {
+	if o.workspaceName == "" {
+		return overlayPath
+	}
+
+	// Overlay path must be under /workspaceName/...
+	prefix := "/" + o.workspaceName
+	if overlayPath == prefix {
+		return "/"
+	}
+	if strings.HasPrefix(overlayPath, prefix+"/") {
+		return overlayPath[len(prefix):]
+	}
+	return "" // Not under workspace
+}
+
+// isWorkspacePath checks if the overlay path is the workspace directory itself
+func (o *OverlayFS) isWorkspacePath(overlayPath string) bool {
+	if o.workspaceName == "" {
+		return overlayPath == "/"
+	}
+	return overlayPath == "/"+o.workspaceName
 }
 
 // Base returns the base filesystem
@@ -52,7 +102,11 @@ func (o *OverlayFS) existsInDelta(ctx context.Context, path string) bool {
 
 // existsInBase checks if a path exists in the base layer
 func (o *OverlayFS) existsInBase(ctx context.Context, path string) bool {
-	_, err := o.base.Lstat(ctx, path)
+	basePath := o.toBasePath(path)
+	if basePath == "" {
+		return false
+	}
+	_, err := o.base.Lstat(ctx, basePath)
 	return err == nil
 }
 
@@ -69,8 +123,12 @@ func (o *OverlayFS) Stat(ctx context.Context, path string) (*Stats, error) {
 		return o.applyOrigin(ctx, stats)
 	}
 
-	// Fall back to base
-	return o.base.Stat(ctx, path)
+	// Fall back to base (with path translation)
+	basePath := o.toBasePath(path)
+	if basePath == "" {
+		return nil, ErrNotFound
+	}
+	return o.base.Stat(ctx, basePath)
 }
 
 // Lstat implements FileSystem.Lstat (does not follow symlinks)
@@ -85,8 +143,12 @@ func (o *OverlayFS) Lstat(ctx context.Context, path string) (*Stats, error) {
 		return o.applyOrigin(ctx, stats)
 	}
 
-	// Fall back to base
-	return o.base.Lstat(ctx, path)
+	// Fall back to base (with path translation)
+	basePath := o.toBasePath(path)
+	if basePath == "" {
+		return nil, ErrNotFound
+	}
+	return o.base.Lstat(ctx, basePath)
 }
 
 // applyOrigin checks for origin mapping and returns the original inode
@@ -112,7 +174,12 @@ func (o *OverlayFS) Readlink(ctx context.Context, path string) (string, error) {
 		return target, nil
 	}
 
-	return o.base.Readlink(ctx, path)
+	// Fall back to base (with path translation)
+	basePath := o.toBasePath(path)
+	if basePath == "" {
+		return "", ErrNotFound
+	}
+	return o.base.Readlink(ctx, basePath)
 }
 
 // Statfs implements FileSystem.Statfs
@@ -141,18 +208,38 @@ func (o *OverlayFS) Readdir(ctx context.Context, path string) ([]DirEntry, error
 		}
 	}
 
-	// Collect entries from base (if not whited out or overridden)
-	if entries, err := o.base.Readdir(ctx, path); err == nil {
-		for _, e := range entries {
-			// Skip if whited out
-			if whiteouts[e.Name] {
-				continue
+	// Handle base layer based on workspace mapping
+	basePath := o.toBasePath(path)
+
+	if path == "/" && o.workspaceName != "" {
+		// At root level with workspace mapping:
+		// Show workspace directory (from base) as an entry
+		if !whiteouts[o.workspaceName] {
+			if _, exists := deltaEntries[o.workspaceName]; !exists {
+				// Check if base root exists
+				if stats, err := o.base.Lstat(ctx, "/"); err == nil && stats.IsDir() {
+					deltaEntries[o.workspaceName] = DirEntry{
+						Name: o.workspaceName,
+						Mode: S_IFDIR | 0755,
+						Ino:  stats.Ino,
+					}
+				}
 			}
-			// Skip if already in delta (delta overrides base)
-			if _, exists := deltaEntries[e.Name]; exists {
-				continue
+		}
+	} else if basePath != "" {
+		// Collect entries from base (if not whited out or overridden)
+		if entries, err := o.base.Readdir(ctx, basePath); err == nil {
+			for _, e := range entries {
+				// Skip if whited out
+				if whiteouts[e.Name] {
+					continue
+				}
+				// Skip if already in delta (delta overrides base)
+				if _, exists := deltaEntries[e.Name]; exists {
+					continue
+				}
+				deltaEntries[e.Name] = e
 			}
-			deltaEntries[e.Name] = e
 		}
 	}
 
@@ -207,18 +294,23 @@ func (o *OverlayFS) ensureParentDirs(ctx context.Context, path string) error {
 			continue
 		}
 
+		// Translate to base path (may be empty if outside workspace)
+		basePath := o.toBasePath(parentPath)
+
 		// Check if parent exists in base
-		baseStats, baseErr := o.base.Lstat(ctx, parentPath)
-		if baseErr == nil && baseStats.IsDir() {
-			// Create matching directory in delta
-			if err := o.delta.Mkdir(ctx, parentPath, baseStats.Perm()); err != nil && err != ErrExists {
-				return err
+		if basePath != "" {
+			if baseStats, baseErr := o.base.Lstat(ctx, basePath); baseErr == nil && baseStats.IsDir() {
+				// Create matching directory in delta
+				if err := o.delta.Mkdir(ctx, parentPath, baseStats.Perm()); err != nil && err != ErrExists {
+					return err
+				}
+				continue
 			}
-		} else {
-			// Create directory in delta
-			if err := o.delta.Mkdir(ctx, parentPath, 0o755); err != nil && err != ErrExists {
-				return err
-			}
+		}
+
+		// Create directory in delta (doesn't exist in base or outside workspace)
+		if err := o.delta.Mkdir(ctx, parentPath, 0o755); err != nil && err != ErrExists {
+			return err
 		}
 	}
 
@@ -329,8 +421,12 @@ func (o *OverlayFS) Open(ctx context.Context, path string, flags int) (File, err
 		}, nil
 	}
 
-	// Read-only from base
-	f, err := o.base.Open(ctx, path, O_RDONLY)
+	// Read-only from base (with path translation)
+	basePath := o.toBasePath(path)
+	if basePath == "" {
+		return nil, ErrNotFound
+	}
+	f, err := o.base.Open(ctx, basePath, O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
@@ -351,14 +447,20 @@ func (o *OverlayFS) copyOnWrite(ctx context.Context, path string) error {
 		return nil
 	}
 
+	// Translate to base path
+	basePath := o.toBasePath(path)
+	if basePath == "" {
+		return ErrNotFound
+	}
+
 	// Get base stats for origin mapping
-	baseStats, err := o.base.Lstat(ctx, path)
+	baseStats, err := o.base.Lstat(ctx, basePath)
 	if err != nil {
 		return err
 	}
 
-	// Copy file to delta
-	deltaIno, err := o.delta.CopyFromBase(ctx, path, o.base)
+	// Copy file to delta using a wrapper that translates paths
+	deltaIno, err := o.delta.CopyFromBaseWithPath(ctx, path, basePath, o.base)
 	if err != nil {
 		return err
 	}
@@ -591,7 +693,11 @@ func (o *OverlayFS) Access(ctx context.Context, path string, mode uint32) error 
 		return nil
 	}
 
-	return o.base.Access(ctx, path, mode)
+	basePath := o.toBasePath(path)
+	if basePath == "" {
+		return ErrNotFound
+	}
+	return o.base.Access(ctx, basePath, mode)
 }
 
 // Ensure OverlayFS implements FileSystem
