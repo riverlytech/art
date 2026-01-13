@@ -1,0 +1,9 @@
+{
+  "binds": [
+    {
+      "host": "/home/sanchitrk/.nvm/versions/node/v24.11.1",
+      "guest": "/opt/node",
+      "readonly": true
+    }
+  ]
+}
